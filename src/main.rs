@@ -4,7 +4,9 @@ use std::{
 };
 
 use clap::Parser;
-use git2::{build::TreeUpdateBuilder, ApplyLocation, DiffOptions, FileMode, Repository};
+use git2::{
+    build::TreeUpdateBuilder, ApplyLocation, DiffOptions, Error, FileMode, Index, Repository, Tree,
+};
 
 #[derive(Parser)]
 struct Cli {
@@ -46,97 +48,21 @@ fn git_format_staged(
 ) -> Result<(), git2::Error> {
     let repo = Repository::open(repo_path)?;
 
-    let mut index = repo.index()?;
-    let mut bad_target = false;
-    let targets: Vec<String> = files
-        .iter()
-        .filter_map(|arg| match index.get_path(arg.as_ref(), 0) {
-            Some(index_entry) => {
-                {
-                    let from = arg;
-                    let to = format!("{}.orig", arg);
-                    std::fs::rename(from, &to).unwrap_or_else(|err| {
-                        eprintln!("error: failed to rename {} to {}: {}", from, to, err);
-                        std::process::exit(1);
-                    });
-                }
-
-                {
-                    let entry_blob = repo.find_blob(index_entry.id).unwrap_or_else(|err| {
-                        eprintln!("error: failed to lookup blob for {}: {}", arg, err);
-                        std::process::exit(1);
-                    });
-
-                    let content = entry_blob.content();
-
-                    {
-                        let path = format!("{}.pre", arg);
-                        std::fs::write(&path, content).unwrap_or_else(|err| {
-                            eprintln!("error: failed to write {}: {}", path, err);
-                            std::process::exit(1);
-                        });
-                    }
-
-                    {
-                        let path = format!("{}.post", arg);
-                        std::fs::write(&path, content).unwrap_or_else(|err| {
-                            eprintln!("error: failed to write {}: {}", path, err);
-                            std::process::exit(1);
-                        });
-
-                        Some(path)
-                    }
-                }
-            }
-            None => {
-                eprintln!("error: {} is not staged", arg);
-                bad_target = true;
-                None
-            }
-        })
-        .collect();
-
-    if bad_target {
-        std::process::exit(1);
-    }
-
-    fn cleanup(args: &[String]) {
-        for arg in args {
-            {
-                let path = format!("{}.pre", arg);
-                std::fs::remove_file(&path).unwrap_or_else(|err| {
-                    eprintln!("error: failed to remove {}: {}", path, err);
-                });
-            }
-
-            {
-                let path = format!("{}.post", arg);
-                std::fs::remove_file(&path).unwrap_or_else(|err| {
-                    eprintln!("error: failed to remove {}: {}", path, err);
-                });
-            }
-        }
-    }
-
-    fn restore(args: &[String]) {
-        cleanup(args);
-
-        for arg in args {
-            let from = format!("{}.orig", arg);
-            let to = arg;
-            std::fs::rename(&from, to).unwrap_or_else(|err| {
-                eprintln!("error: failed to rename {} to {}: {}", from, to, err);
-            });
-        }
-    }
+    prepare_workdir(&repo, files)?;
 
     let exit_status = Command::new(command)
         .args(args)
-        .args(&targets)
+        .args(files)
         .status()
         .unwrap();
     if !exit_status.success() {
-        restore(files);
+        for file in files {
+            // At this point the index hasn't been changed, so `.staged.orig` can be removed.
+            remove_file(&format!("{}.staged.orig", file));
+
+            // Restores the file to its original unstaged version.
+            rename_file(&format!("{}.orig", file), file);
+        }
 
         match exit_status.code() {
             Some(code) => std::process::exit(code),
@@ -147,48 +73,154 @@ fn git_format_staged(
         }
     }
 
-    let index_tree_oid = index.write_tree()?;
-    let index_tree = repo.find_tree(index_tree_oid)?;
-
-    let mut tree_builder = TreeUpdateBuilder::new();
-    for (arg, target) in files.iter().zip(targets.iter()) {
-        let content = std::fs::read(target).unwrap();
-        let blob_oid = repo.blob(&content)?;
-        tree_builder.upsert(arg, blob_oid, FileMode::Blob);
-    }
-
-    let post_tree_oid = tree_builder.create_updated(&repo, &index_tree)?;
-    let post_tree = repo.find_tree(post_tree_oid)?;
-
+    let index_tree = get_index_tree(&repo)?;
+    let formatted_tree = build_formatted_tree(&repo, &index_tree, files)?;
     let diff = repo.diff_tree_to_tree(
         Some(&index_tree),
-        Some(&post_tree),
+        Some(&formatted_tree),
         Some(DiffOptions::new().context_lines(0)),
     )?;
 
     for file in files {
-        let from = format!("{}.orig", file);
-        let to = file;
-        std::fs::copy(&from, to).unwrap_or_else(|err| {
-            eprintln!("error: failed to copy {} to {}: {}", from, to, err);
-            std::process::exit(1);
-        });
+        copy_file(&format!("{}.orig", file), file);
     }
     repo.apply(&diff, ApplyLocation::WorkDir, None)?;
 
-    index.read_tree(&post_tree)?;
+    // Formatting has succeeded and changes have been "backported" to
+    // the unstaged files. The index can be safely updated.
+    let mut index = repo.index()?;
+    index.read_tree(&formatted_tree)?;
     index.write()?;
 
-    cleanup(files);
-
+    // This run has succeeded. The backups can all be safely removed.
     for file in files {
-        let path = format!("{}.orig", file);
-        std::fs::remove_file(&path).unwrap_or_else(|err| {
-            eprintln!("error: failed to remove {}: {}", path, err);
-        });
+        remove_file(&format!("{}.staged.orig", file));
+        remove_file(&format!("{}.orig", file));
     }
 
     Ok(())
+}
+
+/** Creates backups of existing files and copies data out of the index.
+
+* Each file `file` to be formatted is renamed to `file.orig`.
+* The version of `file` in the index is written to the filesystem as `file.staged.orig`.
+* The version of `file` in the index is also written to the filesystem as `file`.
+
+  This is the file that will be formatted.
+
+*/
+fn prepare_workdir(repo: &Repository, files: &[String]) -> Result<(), Error> {
+    let index = repo.index()?;
+
+    rename_originals(&index, files);
+
+    for file in files {
+        match index.get_path(file.as_ref(), 0) {
+            Some(index_entry) => {
+                let entry_blob = repo.find_blob(index_entry.id).unwrap_or_else(|err| {
+                    eprintln!("error: failed to lookup blob for {}: {}", file, err);
+                    std::process::exit(1);
+                });
+
+                let content = entry_blob.content();
+                write_file(&format!("{}.staged.orig", file), content);
+                write_file(file, content);
+            }
+            None => {
+                panic!("internal error: {} is not staged", file);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/** Rename the target files from `file` to `file.orig`.
+
+The `.orig` files need to stick around until the very end of the program, in case
+an unexpected failure happens.
+*/
+fn rename_originals(index: &Index, files: &[String]) {
+    // The user has passed a file that isn't actually staged
+    let mut bad_file = false;
+
+    let renamed_files: Vec<(&str, String)> = files
+        .iter()
+        .filter_map(|arg| match index.get_path(arg.as_ref(), 0) {
+            Some(_) => {
+                let from = arg.as_ref();
+                let to = format!("{}.orig", arg);
+                rename_file(from, &to);
+                Some((from, to))
+            }
+            None => {
+                eprintln!("error: {} is not staged", arg);
+                bad_file = true;
+                None
+            }
+        })
+        .collect();
+
+    if bad_file {
+        for (from, to) in renamed_files {
+            rename_file(&to, from);
+        }
+        std::process::exit(1);
+    }
+}
+
+/// View the current index as a [`Tree`].
+fn get_index_tree(repo: &Repository) -> Result<Tree, Error> {
+    let oid = repo.index()?.write_tree()?;
+    repo.find_tree(oid)
+}
+
+/** Create a [`Tree`], based on `index_tree`, but including the new contents of files
+in `files` that have changed on disk.
+*/
+fn build_formatted_tree<'a>(
+    repo: &'a Repository,
+    index_tree: &Tree,
+    files: &[String],
+) -> Result<Tree<'a>, Error> {
+    let mut tree_builder = TreeUpdateBuilder::new();
+
+    for file in files.iter() {
+        let content = std::fs::read(file).unwrap();
+        let blob_oid = repo.blob(&content)?;
+        tree_builder.upsert(file, blob_oid, FileMode::Blob);
+    }
+
+    let post_tree_oid = tree_builder.create_updated(repo, index_tree)?;
+    repo.find_tree(post_tree_oid)
+}
+
+fn copy_file(from: &str, to: &str) -> u64 {
+    std::fs::copy(from, to).unwrap_or_else(|err| {
+        eprintln!("error: failed to copy {} to {}: {}", from, to, err);
+        std::process::exit(1);
+    })
+}
+
+fn write_file(path: &str, content: &[u8]) {
+    std::fs::write(path, content).unwrap_or_else(|err| {
+        eprintln!("error: failed to write {}: {}", path, err);
+        std::process::exit(1);
+    })
+}
+
+fn rename_file(from: &str, to: &str) {
+    std::fs::rename(from, to).unwrap_or_else(|err| {
+        eprintln!("error: failed to rename {} to {}: {}", from, to, err);
+        std::process::exit(1);
+    })
+}
+
+fn remove_file(path: &str) {
+    std::fs::remove_file(path).unwrap_or_else(|err| {
+        eprintln!("error: failed to remove {}: {}", path, err);
+    })
 }
 
 fn search_upward_for_entry<P: AsRef<Path>>(cwd: P, entry: &str) -> Option<PathBuf> {
