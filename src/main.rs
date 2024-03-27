@@ -62,7 +62,16 @@ fn git_format_staged(
         .args(args)
         .args(files)
         .status()
-        .unwrap();
+        .unwrap_or_else(|err| {
+            eprintln!(
+                "error: command `{command}{}{}{}{}` failed: {err}",
+                if args.is_empty() { "" } else { " " },
+                args.join(" "),
+                if files.is_empty() { "" } else { " " },
+                files.join(" "),
+            );
+            std::process::exit(1);
+        });
     if !exit_status.success() {
         for file in files {
             // At this point the index hasn't been changed, so `.staged.orig` can be removed.
