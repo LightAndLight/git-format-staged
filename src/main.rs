@@ -5,7 +5,8 @@ use std::{
 
 use clap::Parser;
 use git2::{
-    build::TreeUpdateBuilder, ApplyLocation, DiffOptions, Error, FileMode, Index, Repository, Tree,
+    build::TreeUpdateBuilder, ApplyLocation, DiffOptions, Error, FileMode, Index, IndexEntry,
+    Repository, Tree,
 };
 
 #[derive(Parser)]
@@ -30,7 +31,9 @@ fn main() {
             }
         };
 
-        match git_format_staged(&repo_path, &cli.files, command, args) {
+        let repo_path = repo_path.canonicalize().unwrap();
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        match git_format_staged(&repo_path, &cwd, &cli.files, command, args) {
             Ok(()) => {}
             Err(err) => {
                 eprintln!("error: {}", err);
@@ -42,13 +45,18 @@ fn main() {
 
 fn git_format_staged(
     repo_path: &Path,
+    cwd: &Path,
     files: &[String],
     command: &str,
     args: &[String],
 ) -> Result<(), git2::Error> {
     let repo = Repository::open(repo_path)?;
 
-    prepare_workdir(&repo, files)?;
+    assert!(repo_path.is_absolute());
+    assert!(cwd.is_absolute());
+    let dir_prefix = cwd.strip_prefix(repo_path).unwrap();
+
+    prepare_workdir(&repo, dir_prefix, files)?;
 
     let exit_status = Command::new(command)
         .args(args)
@@ -74,7 +82,7 @@ fn git_format_staged(
     }
 
     let index_tree = get_index_tree(&repo)?;
-    let formatted_tree = build_formatted_tree(&repo, &index_tree, files)?;
+    let formatted_tree = build_formatted_tree(&repo, &index_tree, dir_prefix, files)?;
     let diff = repo.diff_tree_to_tree(
         Some(&index_tree),
         Some(&formatted_tree),
@@ -110,13 +118,13 @@ fn git_format_staged(
   This is the file that will be formatted.
 
 */
-fn prepare_workdir(repo: &Repository, files: &[String]) -> Result<(), Error> {
+fn prepare_workdir(repo: &Repository, dir_prefix: &Path, files: &[String]) -> Result<(), Error> {
     let index = repo.index()?;
 
-    rename_originals(&index, files);
+    rename_originals(&index, dir_prefix, files);
 
     for file in files {
-        match index.get_path(file.as_ref(), 0) {
+        match get_staged(&index, dir_prefix, file) {
             Some(index_entry) => {
                 let entry_blob = repo.find_blob(index_entry.id).unwrap_or_else(|err| {
                     eprintln!("error: failed to lookup blob for {}: {}", file, err);
@@ -128,7 +136,7 @@ fn prepare_workdir(repo: &Repository, files: &[String]) -> Result<(), Error> {
                 write_file(file, content);
             }
             None => {
-                panic!("internal error: {} is not staged", file);
+                panic!("internal error: {} is not a staged file", file);
             }
         }
     }
@@ -141,21 +149,21 @@ fn prepare_workdir(repo: &Repository, files: &[String]) -> Result<(), Error> {
 The `.orig` files need to stick around until the very end of the program, in case
 an unexpected failure happens.
 */
-fn rename_originals(index: &Index, files: &[String]) {
+fn rename_originals(index: &Index, dir_prefix: &Path, files: &[String]) {
     // The user has passed a file that isn't actually staged
     let mut bad_file = false;
 
     let renamed_files: Vec<(&str, String)> = files
         .iter()
-        .filter_map(|arg| match index.get_path(arg.as_ref(), 0) {
+        .filter_map(|file| match get_staged(index, dir_prefix, file) {
             Some(_) => {
-                let from = arg.as_ref();
-                let to = format!("{}.orig", arg);
+                let from = file.as_ref();
+                let to = format!("{}.orig", file);
                 rename_file(from, &to);
                 Some((from, to))
             }
             None => {
-                eprintln!("error: {} is not staged", arg);
+                eprintln!("error: {} is not a staged file", file);
                 bad_file = true;
                 None
             }
@@ -182,6 +190,7 @@ in `files` that have changed on disk.
 fn build_formatted_tree<'a>(
     repo: &'a Repository,
     index_tree: &Tree,
+    dir_prefix: &Path,
     files: &[String],
 ) -> Result<Tree<'a>, Error> {
     let mut tree_builder = TreeUpdateBuilder::new();
@@ -189,11 +198,15 @@ fn build_formatted_tree<'a>(
     for file in files.iter() {
         let content = std::fs::read(file).unwrap();
         let blob_oid = repo.blob(&content)?;
-        tree_builder.upsert(file, blob_oid, FileMode::Blob);
+        tree_builder.upsert(dir_prefix.join(file), blob_oid, FileMode::Blob);
     }
 
     let post_tree_oid = tree_builder.create_updated(repo, index_tree)?;
     repo.find_tree(post_tree_oid)
+}
+
+fn get_staged(index: &Index, dir_prefix: &Path, file: &str) -> Option<IndexEntry> {
+    index.get_path(&dir_prefix.join(file), 0)
 }
 
 fn copy_file(from: &str, to: &str) -> u64 {
