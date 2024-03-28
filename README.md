@@ -1,6 +1,6 @@
 # `git-format-staged`
 
-Modify staged files, backporting changes onto their unstaged versions.
+Modify staged files (and their unstaged versions if needed).
 Useful for formatting files as part of a [pre-commit hook](https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks).
 
 Example:
